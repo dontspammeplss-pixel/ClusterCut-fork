@@ -3,7 +3,10 @@
 
 use crate::state::AppState;
 use crate::storage;
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
+// Only the GNOME-extension-state push below emits, and that is Linux-only.
+#[cfg(target_os = "linux")]
+use tauri::Emitter;
 #[cfg(target_os = "macos")]
 use crate::{NotificationPayload, send_notification};
 
@@ -35,10 +38,69 @@ pub(crate) struct ExtensionStatus {
 pub(crate) struct ExtensionInstallResult {
     /// Directory the extension was written to, shown to the user.
     pub(crate) installed_to: String,
-    /// True when GNOME Shell accepted the enable request right away. Normally
+    /// True when GNOME Shell accepted the enable request right away, meaning the
+    /// shell already knew about this UUID and the extension is live now. Normally
     /// false: the shell only scans for user extensions at startup, so a log out
     /// and back in is required before the extension can load.
     pub(crate) enabled: bool,
+    /// True when the UUID is in `org.gnome.shell enabled-extensions`, so GNOME
+    /// Shell will activate the extension on its next start. False means the
+    /// enable request failed at both levels and the user may also have to switch
+    /// it on in the Extensions app after logging back in.
+    pub(crate) enabled_at_next_login: bool,
+}
+
+/// True when the extension's files exist in either location GNOME Shell scans.
+///
+/// Installed is not loaded: on GNOME Wayland the shell only scans these
+/// directories at startup, so freshly written files stay inert until the next
+/// session start.
+fn extension_installed_on_disk() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let local = format!("{home}/.local/share/gnome-shell/extensions/{EXTENSION_UUID}");
+    let system = format!("/usr/share/gnome-shell/extensions/{EXTENSION_UUID}");
+    std::path::Path::new(&local).exists() || std::path::Path::new(&system).exists()
+}
+
+/// Everything the extension dialog needs to know about the extension's state,
+/// pushed to the frontend on every observed change.
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, Clone)]
+pub(crate) struct GnomeExtensionState {
+    /// The extension's D-Bus clipboard bridge answered its introspection probe:
+    /// GNOME Shell has loaded and enabled it, so clipboard sync is running. This
+    /// is the authoritative "the extension is live" signal — it is the same
+    /// probe that promotes the clipboard backend to `GnomeExtension`.
+    pub(crate) bridge_live: bool,
+    /// The extension's files are present on disk. Installed does NOT imply
+    /// loaded or enabled; see `extension_installed_on_disk`.
+    pub(crate) installed: bool,
+    /// GNOME on Wayland with no live bridge, i.e. clipboard sync is broken until
+    /// the extension loads. False off GNOME and on X11, where the clipboard is
+    /// read directly and no extension is involved.
+    pub(crate) requires_extension: bool,
+}
+
+/// Current extension/bridge state as the UI needs it.
+#[cfg(target_os = "linux")]
+pub(crate) async fn gnome_extension_state() -> GnomeExtensionState {
+    use crate::clipboard;
+    let bridge_live = clipboard::dbus_clipboard::is_available_async().await;
+    GnomeExtensionState {
+        bridge_live,
+        installed: extension_installed_on_disk(),
+        requires_extension: clipboard::is_gnome() && clipboard::is_wayland() && !bridge_live,
+    }
+}
+
+/// Push the current state to the frontend.
+///
+/// Called from the clipboard watcher on every transition and right after an
+/// install, so the extension dialog tracks reality instead of freezing whatever
+/// it saw when the app started.
+#[cfg(target_os = "linux")]
+pub(crate) async fn emit_gnome_extension_state(app: &AppHandle) {
+    let _ = app.emit("gnome-extension-state", gnome_extension_state().await);
 }
 
 #[derive(serde::Serialize)]
@@ -135,11 +197,7 @@ pub(crate) async fn check_gnome_extension_status() -> ExtensionStatus {
     }
 
     // Fallback to File Check (for native builds)
-    let home = std::env::var("HOME").unwrap_or_default();
-    let local_path = format!("{}/.local/share/gnome-shell/extensions/{EXTENSION_UUID}", home);
-    let system_path = format!("/usr/share/gnome-shell/extensions/{EXTENSION_UUID}");
-
-    let is_installed = std::path::Path::new(&local_path).exists() || std::path::Path::new(&system_path).exists();
+    let is_installed = extension_installed_on_disk();
 
     ExtensionStatus {
         is_gnome: true,
@@ -149,22 +207,26 @@ pub(crate) async fn check_gnome_extension_status() -> ExtensionStatus {
 }
 
 /// Installs the ClusterCut GNOME Shell extension into the user's extension
-/// directory from the sources embedded in this binary, then asks GNOME Shell to
-/// enable it.
+/// directory from the sources embedded in this binary, then arranges for GNOME
+/// Shell to load and enable it.
 ///
 /// The extension is what makes clipboard sync work on GNOME Wayland: mutter
 /// withholds the clipboard from background apps there, so the bridge has to run
 /// inside the compositor. Users on other desktops never see this (the UI only
 /// offers it on GNOME — see `check_gnome_extension_status`).
 #[tauri::command]
-pub(crate) async fn install_gnome_extension() -> Result<ExtensionInstallResult, String> {
+pub(crate) async fn install_gnome_extension(app: AppHandle) -> Result<ExtensionInstallResult, String> {
     #[cfg(target_os = "linux")]
     {
-        install_gnome_extension_impl().await
+        let result = install_gnome_extension_impl().await?;
+        // Reflect the new on-disk state in the UI immediately.
+        emit_gnome_extension_state(&app).await;
+        Ok(result)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = app;
         Err("The ClusterCut GNOME extension can only be installed on Linux.".to_string())
     }
 }
@@ -194,10 +256,9 @@ async fn install_gnome_extension_impl() -> Result<ExtensionInstallResult, String
             .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
     }
 
-    // Best-effort enable. This fails today because GNOME Shell only scans the
-    // user extension directory at startup, so a newly installed extension is
-    // unknown to it — the caller reports the log-out-and-back-in step instead
-    // of treating that as an error.
+    // Best-effort enable. This succeeds only when GNOME Shell has already
+    // scanned this UUID (e.g. reinstalling over a previous session's install),
+    // because `enableExtension` returns false for an unknown uuid.
     let mut enabled = false;
     if let Ok(connection) = zbus::Connection::session().await {
         let proxy = zbus::Proxy::new(
@@ -213,15 +274,95 @@ async fn install_gnome_extension_impl() -> Result<ExtensionInstallResult, String
         }
     }
 
+    // For the usual case — a brand-new install the shell has never scanned — the
+    // D-Bus enable is impossible, so record the UUID in `enabled-extensions`
+    // ourselves. That is the list the shell reads when it next starts, and
+    // without it the extension would come up installed but inactive, leaving
+    // clipboard sync just as broken after the log out as before it.
+    let enabled_at_next_login = enabled || add_uuid_to_enabled_extensions();
+
     tracing::info!(
-        "Installed GNOME extension {EXTENSION_UUID} to {} (enabled immediately: {enabled})",
+        "Installed GNOME extension {EXTENSION_UUID} to {} \
+         (enabled now: {enabled}, enabled at next login: {enabled_at_next_login})",
         dest.display()
     );
 
     Ok(ExtensionInstallResult {
         installed_to: dest.display().to_string(),
         enabled,
+        enabled_at_next_login,
     })
+}
+
+/// Add our UUID to `org.gnome.shell enabled-extensions` without disturbing the
+/// extensions already listed there, so GNOME Shell activates the extension when
+/// it next scans the extension directories.
+///
+/// Uses `gsettings` (a fixed argv — no shell, no user input) because the
+/// D-Bus API cannot do this for an unscanned UUID and GSettings has no D-Bus
+/// binding to call directly. Returns false if gsettings is unavailable, e.g. in
+/// a sandbox without dconf access; the caller then tells the user to enable the
+/// extension by hand rather than claiming success.
+#[cfg(target_os = "linux")]
+fn add_uuid_to_enabled_extensions() -> bool {
+    const SCHEMA: &str = "org.gnome.shell";
+    const KEY: &str = "enabled-extensions";
+
+    let current = match std::process::Command::new("gsettings")
+        .args(["get", SCHEMA, KEY])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Ok(out) => {
+            tracing::warn!(
+                "gsettings get {SCHEMA} {KEY} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!("Could not run gsettings to enable the extension: {e}");
+            return false;
+        }
+    };
+
+    if current.contains(EXTENSION_UUID) {
+        return true;
+    }
+
+    // `gsettings get` yields e.g. "@as []" or "['dash-to-dock@micxgx.gmail.com']".
+    // Reuse the existing text verbatim — no parse/re-quote round trip — and just
+    // append ours to the array literal.
+    let inner = current
+        .trim_start_matches("@as")
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+
+    let value = if inner.is_empty() {
+        format!("['{EXTENSION_UUID}']")
+    } else {
+        format!("[{inner}, '{EXTENSION_UUID}']")
+    };
+
+    match std::process::Command::new("gsettings")
+        .args(["set", SCHEMA, KEY, &value])
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            tracing::warn!(
+                "gsettings set {SCHEMA} {KEY} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("Could not run gsettings to enable the extension: {e}");
+            false
+        }
+    }
 }
 
 #[tauri::command]

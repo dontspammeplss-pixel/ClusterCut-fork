@@ -270,4 +270,11 @@ async fn reconcile(
             // No transition needed.
         }
     }
+
+    // Push the (possibly unchanged) state to the UI. reconcile() runs once at
+    // startup and on every extension state change, which is exactly when the
+    // extension dialog needs to re-evaluate what it is showing — most visibly
+    // when a freshly installed extension finally comes up and the "log out and
+    // back in" prompt turns into "clipboard sync is running".
+    crate::commands::system::emit_gnome_extension_state(app_handle).await;
 }

@@ -82,6 +82,21 @@ export interface NotificationSettings {
   data_received: boolean;
 }
 
+// Pushed on the `gnome-extension-state` event whenever the clipboard watcher
+// reconciles the backend, so the extension dialog tracks the live GNOME Shell
+// state instead of freezing what it saw at startup.
+export interface GnomeExtensionState {
+  // The extension's D-Bus clipboard bridge answered: the extension is loaded
+  // and clipboard sync is running.
+  bridge_live: boolean;
+  // The extension's files are present on disk — installed, not necessarily
+  // loaded (GNOME Shell only scans for extensions at session start).
+  installed: boolean;
+  // GNOME Wayland with no live bridge: clipboard sync is broken until the
+  // extension loads. False on X11 and off GNOME.
+  requires_extension: boolean;
+}
+
 export interface AppSettings {
   custom_device_name: string | null;
   cluster_mode: "auto" | "provisioned";

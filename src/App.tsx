@@ -19,7 +19,7 @@ import { IncompatibleModal, ConnectionFailedModal, JoinModal, LeaveModal, AddRem
 import { LegacyPeerBanner, PairingLockoutBanner } from "./components/Banners";
 import type {
   Peer, View, NearbyNetwork, ClipboardBlobPreview, ClipboardFormatPreview,
-  HistoryItem, AppSettings,
+  HistoryItem, AppSettings, GnomeExtensionState,
 } from "./types";
 import { blobPreviewFromPreview, formatsFromPayload } from "./lib/protocol";
 
@@ -51,6 +51,12 @@ export default function App() {
   // copy over IPC rather than a link to an external listing.
   const [extensionInstalling, setExtensionInstalling] = useState(false);
   const [extensionInstalled, setExtensionInstalled] = useState(false);
+  // Live from the backend: the extension's D-Bus bridge is answering, i.e. GNOME
+  // Shell has loaded it and clipboard sync is actually running.
+  const [extensionBridgeLive, setExtensionBridgeLive] = useState(false);
+  // Set when the backend could not record the extension in GNOME's
+  // enabled-extensions list, so the user has to switch it on by hand.
+  const [extensionNeedsManualEnable, setExtensionNeedsManualEnable] = useState(false);
   const [extensionInstallError, setExtensionInstallError] = useState<string | null>(null);
   // Flatpak on a non-GNOME Wayland compositor: the sandbox is denied the
   // data-control protocols, so clipboard sync cannot work at all here.
@@ -402,9 +408,10 @@ export default function App() {
     setExtensionInstalling(true);
     setExtensionInstallError(null);
     try {
-      const result = await invoke<{ installed_to: string; enabled: boolean }>("install_gnome_extension");
-      logToBackend(`Installed GNOME extension to ${result.installed_to} (enabled immediately: ${result.enabled})`);
+      const result = await invoke<{ installed_to: string; enabled: boolean; enabled_at_next_login: boolean }>("install_gnome_extension");
+      logToBackend(`Installed GNOME extension to ${result.installed_to} (enabled now: ${result.enabled}, enabled at next login: ${result.enabled_at_next_login})`);
       setExtensionInstalled(true);
+      setExtensionNeedsManualEnable(!result.enabled_at_next_login);
     } catch (e) {
       console.error("Failed to install GNOME extension:", e);
       setExtensionInstallError(String(e));
@@ -674,6 +681,36 @@ export default function App() {
       setIsAutoSend(event.payload.auto_send);
     });
 
+    // Live GNOME extension / clipboard-bridge state. The backend pushes this
+    // whenever the clipboard watcher reconciles the backend — at startup and on
+    // every extension state change — so the dialog reflects reality rather than
+    // freezing the one-shot check done when the app mounted.
+    const unlistenGnomeExtension = listen<GnomeExtensionState>("gnome-extension-state", (event) => {
+      const { bridge_live, installed, requires_extension } = event.payload;
+      setExtensionBridgeLive(bridge_live);
+      setExtensionInstalled(installed);
+
+      if (bridge_live) {
+        // The bridge answered, so the extension is loaded and clipboard sync is
+        // running. The prompt has nothing left to ask for.
+        setClipboardRequiresExtension(false);
+        setShowExtensionDialog(false);
+        return;
+      }
+
+      if (requires_extension && !installed) {
+        // GNOME Wayland with nothing installed: clipboard sync is broken until
+        // the extension exists. Always surface it, regardless of "don't ask me
+        // again" — there is a concrete action to take.
+        setClipboardRequiresExtension(true);
+        setShowExtensionDialog(true);
+      }
+      // Installed-but-not-live deliberately does not re-open the dialog: the user
+      // may have switched the extension off on purpose, and the clipboard
+      // watcher already posts a notification for that case. If the dialog is
+      // open (they just clicked Install) the state above still updates its copy.
+    });
+
     return () => {
       unlistenPeer.then((f) => f());
       unlistenClipboard.then((f) => f());
@@ -690,6 +727,7 @@ export default function App() {
       unlistenIncompatible.then((f) => f());
       unlistenNotification.then((f) => f());
       unlistenSettingsChanged.then((f) => f());
+      unlistenGnomeExtension.then((f) => f());
       unlistenPairingLocked.then((f) => f());
       unlistenPairingRearmed.then((f) => f());
       unlistenPairingAcceptChanged.then((f) => f());
@@ -1106,7 +1144,9 @@ export default function App() {
                   <strong>Clipboard synchronisation will not work</strong> without the ClusterCut GNOME extension.
                 </p>
                 <p className="text-slate-600 dark:text-zinc-400 text-sm">
-                  GNOME on Wayland does not allow background apps to access the clipboard. The extension runs inside the compositor and bridges clipboard changes to ClusterCut. Without it, clipboard monitoring is disabled.
+                  {extensionInstalled
+                    ? "The extension is installed, but GNOME Shell has not loaded it yet — GNOME only scans for extensions when the session starts."
+                    : "GNOME on Wayland does not allow background apps to access the clipboard. The extension runs inside the compositor and bridges clipboard changes to ClusterCut. Without it, clipboard monitoring is disabled."}
                 </p>
               </>
             ) : (
@@ -1120,9 +1160,16 @@ export default function App() {
               </>
             )}
 
-            {extensionInstalled && (
-              <p className="text-emerald-600 dark:text-emerald-400 text-sm">
-                Extension installed. Log out and back in so GNOME Shell picks it up — clipboard sync will start automatically afterwards, with no further setup.
+            {extensionInstalled && !extensionBridgeLive && (
+              <p className="text-slate-600 dark:text-zinc-400 text-sm">
+                Log out and back in and clipboard sync will start on its own — there is nothing else to
+                configure. This dialog closes by itself once the extension is running.
+              </p>
+            )}
+            {extensionNeedsManualEnable && (
+              <p className="text-amber-600 dark:text-amber-500 text-sm">
+                ClusterCut could not add itself to GNOME's enabled-extensions list, so after logging back
+                in you may also need to switch it on in the Extensions app.
               </p>
             )}
             {extensionInstallError && (
