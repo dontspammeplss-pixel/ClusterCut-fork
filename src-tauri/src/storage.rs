@@ -49,13 +49,15 @@ fn restrict_dacl_owner_system_only(path: &Path) {
     use windows::Win32::Foundation::{LocalFree, HLOCAL, WIN32_ERROR};
     use windows::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+        TRUSTEE_W,
     };
     use windows::Win32::Security::{
         CreateWellKnownSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
         OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSID, PSECURITY_DESCRIPTOR,
+        // Lives in Win32::Security (accctrl.h), not in the Authorization submodule.
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
     };
     use windows::core::{PCWSTR, PWSTR};
 
