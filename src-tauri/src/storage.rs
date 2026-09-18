@@ -79,14 +79,16 @@ fn restrict_dacl_owner_system_only(path: &Path) {
     // SYSTEM SID for the second ACE.
     let mut system_buf = [0u8; 68];
     let mut system_len = system_buf.len() as u32;
-    if CreateWellKnownSid(
-        WinLocalSystemSid,
-        None,
-        Some(PSID(system_buf.as_mut_ptr() as *mut _)),
-        &mut system_len,
-    )
-    .is_err()
-    {
+    let sid_ok = unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            None,
+            Some(PSID(system_buf.as_mut_ptr() as *mut _)),
+            &mut system_len,
+        )
+        .is_ok()
+    };
+    if !sid_ok {
         fail("CreateWellKnownSid");
         return;
     }
