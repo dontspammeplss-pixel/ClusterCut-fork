@@ -47,6 +47,11 @@ export default function App() {
   const [activeView, setActiveView] = useState<View>("devices");
   const [showExtensionDialog, setShowExtensionDialog] = useState(false);
   const [clipboardRequiresExtension, setClipboardRequiresExtension] = useState(false);
+  // The extension ships inside the app binary, so "install" is a local file
+  // copy over IPC rather than a link to an external listing.
+  const [extensionInstalling, setExtensionInstalling] = useState(false);
+  const [extensionInstalled, setExtensionInstalled] = useState(false);
+  const [extensionInstallError, setExtensionInstallError] = useState<string | null>(null);
   // Flatpak on a non-GNOME Wayland compositor: the sandbox is denied the
   // data-control protocols, so clipboard sync cannot work at all here.
   const [showSandboxDialog, setShowSandboxDialog] = useState(false);
@@ -393,14 +398,19 @@ export default function App() {
     setShowSandboxDialog(false);
   };
 
-  const handleInstallExtension = () => {
-    const extUrl = "https://extensions.gnome.org/extension/9341/clustercut/";
-    openUrl(extUrl).catch((e: unknown) => {
-        console.error("Failed to open URL via plugin-opener:", e);
-        // Fallback to window.open (might be blocked by CSP or Tauri config)
-        window.open(extUrl, "_blank");
-    });
-    setShowExtensionDialog(false);
+  const handleInstallExtension = async () => {
+    setExtensionInstalling(true);
+    setExtensionInstallError(null);
+    try {
+      const result = await invoke<{ installed_to: string; enabled: boolean }>("install_gnome_extension");
+      logToBackend(`Installed GNOME extension to ${result.installed_to} (enabled immediately: ${result.enabled})`);
+      setExtensionInstalled(true);
+    } catch (e) {
+      console.error("Failed to install GNOME extension:", e);
+      setExtensionInstallError(String(e));
+    } finally {
+      setExtensionInstalling(false);
+    }
   };
 
   const handleIgnoreExtension = async () => {
@@ -1110,7 +1120,18 @@ export default function App() {
               </>
             )}
 
-            {!clipboardRequiresExtension && (
+            {extensionInstalled && (
+              <p className="text-emerald-600 dark:text-emerald-400 text-sm">
+                Extension installed. Log out and back in so GNOME Shell picks it up — clipboard sync will start automatically afterwards, with no further setup.
+              </p>
+            )}
+            {extensionInstallError && (
+              <p className="text-red-600 dark:text-red-400 text-sm">
+                Could not install the extension: {extensionInstallError}
+              </p>
+            )}
+
+            {!clipboardRequiresExtension && !extensionInstalled && (
               <div className="flex items-center space-x-2 pt-2">
                 <input
                   type="checkbox"
@@ -1129,7 +1150,7 @@ export default function App() {
             )}
 
             <div className="flex justify-end gap-3 pt-2">
-              {!clipboardRequiresExtension && (
+              {!clipboardRequiresExtension && !extensionInstalled && (
                 <Button
                   variant="default"
                   onClick={() => setShowExtensionDialog(false)}
@@ -1137,13 +1158,23 @@ export default function App() {
                   No Thanks
                 </Button>
               )}
-              <Button
-                variant="primary"
-                onClick={handleInstallExtension}
-              >
-                Install Extension
-              </Button>
-              {clipboardRequiresExtension && (
+              {extensionInstalled ? (
+                <Button
+                  variant="primary"
+                  onClick={() => setShowExtensionDialog(false)}
+                >
+                  Close
+                </Button>
+              ) : (
+                <Button
+                  variant="primary"
+                  onClick={handleInstallExtension}
+                  disabled={extensionInstalling}
+                >
+                  {extensionInstalling ? "Installing…" : "Install Extension"}
+                </Button>
+              )}
+              {clipboardRequiresExtension && !extensionInstalled && (
                 <Button
                   variant="default"
                   onClick={() => setShowExtensionDialog(false)}

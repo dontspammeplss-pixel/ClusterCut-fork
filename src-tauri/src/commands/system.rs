@@ -7,12 +7,38 @@ use tauri::Manager;
 #[cfg(target_os = "macos")]
 use crate::{NotificationPayload, send_notification};
 
+/// UUID of the bundled GNOME Shell extension. Must match `metadata.json` and
+/// the `EXTENSION_UUID` in `clipboard/watcher.rs`.
+const EXTENSION_UUID: &str = "clustercut@keithvassallo.com";
+
+/// GNOME Shell extension sources, embedded at compile time from the repo's
+/// `gnome-extension/` directory.
+///
+/// Embedding rather than shipping them as a Tauri resource keeps the app and
+/// the extension it installs in lockstep (no version skew between the two), and
+/// means the install command needs no runtime path resolution — it works
+/// identically in a dev build, a deb/rpm install and a Flatpak sandbox.
+const EXTENSION_JS: &str = include_str!("../../../gnome-extension/extension.js");
+const EXTENSION_METADATA: &str = include_str!("../../../gnome-extension/metadata.json");
+const EXTENSION_ICON: &str =
+    include_str!("../../../gnome-extension/icons/hicolor/symbolic/apps/clustercut-symbolic.svg");
+
 #[derive(serde::Serialize)]
 pub(crate) struct ExtensionStatus {
     pub(crate) is_gnome: bool,
     pub(crate) is_installed: bool,
     /// True when on GNOME Wayland without the extension — clipboard sync will NOT work
     pub(crate) clipboard_requires_extension: bool,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ExtensionInstallResult {
+    /// Directory the extension was written to, shown to the user.
+    pub(crate) installed_to: String,
+    /// True when GNOME Shell accepted the enable request right away. Normally
+    /// false: the shell only scans for user extensions at startup, so a log out
+    /// and back in is required before the extension can load.
+    pub(crate) enabled: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -98,7 +124,7 @@ pub(crate) async fn check_gnome_extension_status() -> ExtensionStatus {
               let call_result: zbus::Result<std::collections::HashMap<String, std::collections::HashMap<String, zbus::zvariant::OwnedValue>>> = proxy.call("ListExtensions", &()).await;
 
               if let Ok(extensions) = call_result {
-                   let is_installed = extensions.contains_key("clustercut@keithvassallo.com");
+                   let is_installed = extensions.contains_key(EXTENSION_UUID);
                    return ExtensionStatus {
                        is_gnome: true,
                        is_installed,
@@ -110,16 +136,92 @@ pub(crate) async fn check_gnome_extension_status() -> ExtensionStatus {
 
     // Fallback to File Check (for native builds)
     let home = std::env::var("HOME").unwrap_or_default();
-    let local_path = format!("{}/.local/share/gnome-shell/extensions/clustercut@keithvassallo.com", home);
-    let system_path = "/usr/share/gnome-shell/extensions/clustercut@keithvassallo.com";
+    let local_path = format!("{}/.local/share/gnome-shell/extensions/{EXTENSION_UUID}", home);
+    let system_path = format!("/usr/share/gnome-shell/extensions/{EXTENSION_UUID}");
 
-    let is_installed = std::path::Path::new(&local_path).exists() || std::path::Path::new(system_path).exists();
+    let is_installed = std::path::Path::new(&local_path).exists() || std::path::Path::new(&system_path).exists();
 
     ExtensionStatus {
         is_gnome: true,
         is_installed,
         clipboard_requires_extension: is_wayland && !is_installed,
     }
+}
+
+/// Installs the ClusterCut GNOME Shell extension into the user's extension
+/// directory from the sources embedded in this binary, then asks GNOME Shell to
+/// enable it.
+///
+/// The extension is what makes clipboard sync work on GNOME Wayland: mutter
+/// withholds the clipboard from background apps there, so the bridge has to run
+/// inside the compositor. Users on other desktops never see this (the UI only
+/// offers it on GNOME — see `check_gnome_extension_status`).
+#[tauri::command]
+pub(crate) async fn install_gnome_extension() -> Result<ExtensionInstallResult, String> {
+    #[cfg(target_os = "linux")]
+    {
+        install_gnome_extension_impl().await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("The ClusterCut GNOME extension can only be installed on Linux.".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn install_gnome_extension_impl() -> Result<ExtensionInstallResult, String> {
+    use std::io::Write;
+
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let dest = std::path::Path::new(&home)
+        .join(".local/share/gnome-shell/extensions")
+        .join(EXTENSION_UUID);
+    let icon_dir = dest.join("icons/hicolor/symbolic/apps");
+
+    std::fs::create_dir_all(&icon_dir)
+        .map_err(|e| format!("Could not create {}: {e}", dest.display()))?;
+
+    let files: [(&std::path::PathBuf, &str); 3] = [
+        (&dest.join("extension.js"), EXTENSION_JS),
+        (&dest.join("metadata.json"), EXTENSION_METADATA),
+        (&icon_dir.join("clustercut-symbolic.svg"), EXTENSION_ICON),
+    ];
+    for (path, contents) in files {
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    }
+
+    // Best-effort enable. This fails today because GNOME Shell only scans the
+    // user extension directory at startup, so a newly installed extension is
+    // unknown to it — the caller reports the log-out-and-back-in step instead
+    // of treating that as an error.
+    let mut enabled = false;
+    if let Ok(connection) = zbus::Connection::session().await {
+        let proxy = zbus::Proxy::new(
+            &connection,
+            "org.gnome.Shell",
+            "/org/gnome/Shell",
+            "org.gnome.Shell.Extensions",
+        )
+        .await;
+        if let Ok(proxy) = proxy {
+            let call: zbus::Result<bool> = proxy.call("EnableExtension", &(EXTENSION_UUID)).await;
+            enabled = matches!(call, Ok(true));
+        }
+    }
+
+    tracing::info!(
+        "Installed GNOME extension {EXTENSION_UUID} to {} (enabled immediately: {enabled})",
+        dest.display()
+    );
+
+    Ok(ExtensionInstallResult {
+        installed_to: dest.display().to_string(),
+        enabled,
+    })
 }
 
 #[tauri::command]
