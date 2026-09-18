@@ -84,8 +84,14 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # `tauri/custom-protocol` is what switches Tauri from dev mode to
+      # production: tauri's build script sets `dev = !custom_protocol` and
+      # tauri-macros does `dev: cfg!(not(feature = "custom-protocol"))`, so
+      # without it generate_context!() embeds the devUrl instead of ../dist and
+      # the shipped binary opens http://localhost:1420. The Tauri CLI adds this
+      # feature for you (`just build-no-bundle`); a bare `cargo build` does not.
       - name: Build release binary
-        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+        run: cargo build --release --locked --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
