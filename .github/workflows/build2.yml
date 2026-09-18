@@ -1,0 +1,95 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Superseded runs on the same branch/PR are pointless — drop them.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One platform failing shouldn't cancel the other.
+      fail-fast: false
+      matrix:
+        include:
+          # A Tauri app cannot be cross-compiled: the Windows target needs MSVC
+          # plus the WebView2/Windows SDK bits, so each platform builds on its
+          # own runner instead of mingw on Linux.
+          - name: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: clustercut
+          - name: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: clustercut.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
+
+      # aws-lc-sys (pulled in by rustls' aws_lc_rs feature) assembles x86-64
+      # crypto with NASM, which the Windows runner image does not ship.
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # tauri::generate_context!() embeds ../dist at compile time, so the
+      # frontend has to exist before cargo runs.
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build release binary
+        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clustercut-${{ matrix.name }}
+          path: src-tauri/target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
