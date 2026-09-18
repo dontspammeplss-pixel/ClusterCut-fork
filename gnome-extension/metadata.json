@@ -1,0 +1,13 @@
+{
+  "name": "ClusterCut",
+  "description": "Integration for ClusterCut Clipboard Sync. Adds a Quick Settings toggle and reads/writes the system clipboard to enable clipboard sync on Wayland.",
+  "uuid": "clustercut@keithvassallo.com",
+  "shell-version": [
+    "45", "46", "47", "48", "49", "50"
+  ],
+  "url": "https://github.com/keithvassallomt/ClusterCut",
+  "version-name": "4.0",
+  "donations": {
+    "github": "keithvassallomt"
+  }
+}

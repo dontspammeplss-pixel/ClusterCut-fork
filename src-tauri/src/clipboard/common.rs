@@ -1,0 +1,1747 @@
+use crate::clipboard::history_store::{Evicted, StoredContent};
+use crate::clipboard::preview::{
+    descriptor_preview, formats_preview, make_thumbnail, preview_parts, ClipboardPreview,
+};
+use crate::protocol::{ClipboardBlob, ClipboardFormat, ClipboardPayload, FileMetadata, Message};
+use crate::state::{AppState, ClipboardBlobMetadata};
+use crate::storage;
+use crate::transport::Transport;
+use std::thread;
+use tauri::{AppHandle, Emitter, Manager};
+
+use once_cell::sync::Lazy;
+use std::sync::{Arc, Mutex};
+
+/// Encoded-byte threshold above which a clipboard image switches from the
+/// inline `Message::Clipboard` path to the descriptor + file-transfer path
+/// (§3.3 in `BLOB_DATA_TRANSFER_PLAN.md`). At or below this size, bytes
+/// ride inline; above it, the sender writes a temp file, registers it,
+/// and broadcasts a descriptor for the receiver to fetch via the
+/// `clustercut-file` ALPN stream.
+pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Absolute upper bound on clipboard-image bytes. Anything larger drops with
+/// a warning — both the inline path and the descriptor + file-transfer path
+/// would still in principle work (file transfer has no per-message cap), but
+/// arbitrarily large clipboard payloads hit memory pressure on the sender's
+/// PNG encode and the receiver's accumulator, and are vanishingly rare in
+/// real-world clipboard use. 500 MB is several times bigger than the
+/// largest plausible image clipboard payload (a 4K uncompressed BMP is
+/// ~33 MB, an 8K PNG screenshot tops out around ~150 MB).
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 500 * 1024 * 1024;
+
+/// Plain text at or below this size is inlined into `Message::Clipboard` as a
+/// JSON string. Above it, the sender stages the text and broadcasts a
+/// descriptor; peers fetch it over the `clustercut-file` ALPN (like big
+/// images). Matches the image inline threshold.
+pub const MAX_CLIPBOARD_TEXT_WIRE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Absolute ceiling for plain text. The sender will not share text larger than
+/// this (it notifies instead), and the receiver caps its defensive stream
+/// drain here for `text/*` blobs.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 100 * 1024 * 1024;
+
+/// How a plain-text clipboard payload should travel, by decoded byte length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextWireDecision {
+    /// Inline in the JSON message (small text, the common case).
+    Inline,
+    /// Stage + broadcast a descriptor; bytes ride the file-transfer ALPN.
+    Descriptor,
+    /// Too large to share at all — notify and skip.
+    TooLarge,
+}
+
+/// Decide how a plain-text payload of `len` bytes should travel.
+pub fn text_wire_decision(len: usize) -> TextWireDecision {
+    if len <= MAX_CLIPBOARD_TEXT_WIRE_BYTES {
+        TextWireDecision::Inline
+    } else if len <= MAX_CLIPBOARD_TEXT_BYTES {
+        TextWireDecision::Descriptor
+    } else {
+        TextWireDecision::TooLarge
+    }
+}
+
+/// Threshold above which a "Receiving large clipboard…" notification fires on
+/// the receiver side. A multi-MB inline transfer takes a perceptible amount
+/// of time on the network and the user might paste mid-transfer otherwise.
+pub const LARGE_CLIPBOARD_BLOB_NOTIFY_THRESHOLD: usize = 10 * 1024 * 1024;
+
+/// MIME types whose bytes pass through verbatim instead of being decoded
+/// and re-encoded to PNG. Three reasons to preserve a source MIME:
+///
+/// - **Vector**: SVG (`image/svg+xml`). PNG-normalising loses the vector
+///   representation entirely and gives downstream apps a flattened raster
+///   instead of an editable shape.
+/// - **Animated**: GIF (`image/gif`). PNG-normalising loses the animation
+///   (only frame 0 survives the RGBA round-trip).
+/// - **Wire-size sane for photos**: JPEG (`image/jpeg`). PNG-normalising a
+///   30 MB JPEG photo decodes RGBA and re-encodes lossless PNG, ballooning
+///   to ~150 MB which exceeds the 60 MB wire cap and silently drops the
+///   sync. Keeping JPEG verbatim preserves the source's compression
+///   choice and never inflates.
+///
+/// Bytes ride the wire under the source MIME and the receiver writes them
+/// verbatim under that same MIME. Whether a destination app *paints* the
+/// SVG, *animates* the GIF, or *renders* the JPEG is the destination's
+/// concern.
+pub fn is_passthrough_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/svg+xml" | "image/gif" | "image/jpeg")
+}
+
+/// Compute a stable, cheap content fingerprint for a `ClipboardPayload` used
+/// by both the sender (broadcast dedup) and receiver (re-broadcast loop guard)
+/// against `state.last_clipboard_content`. Both ends must agree on the format
+/// so a blob received from a peer can correctly suppress an immediate
+/// re-broadcast back to that peer.
+///
+/// Format:
+/// - Files:    `FILES:name1:size1;name2:size2;…`
+/// - Blob:     `BLOB:<mime>:<base64_len>:<head16_hex>:<tail16_hex>`
+/// - Formats:  `<text>|FORMATS:mime1:len1;mime2:len2;…` (when `formats` is
+///             non-empty; the text portion still distinguishes two copies
+///             that happen to carry the same MIME set with different bytes)
+/// - Text:     the text itself (or empty string)
+/// Content-derived fingerprint for a large blob/text descriptor (see
+/// `ClipboardBlob::content_hash`). 128 bits of SHA-256 — ample to avoid
+/// collisions for realistic clipboard content, and cheap relative to the
+/// staging + transfer the descriptor path already performs.
+pub fn content_fingerprint(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest[..16].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+pub fn payload_signature(payload: &ClipboardPayload) -> String {
+    if let Some(files) = payload.files.as_ref() {
+        if !files.is_empty() {
+            let mut sig = String::from("FILES:");
+            for f in files {
+                use std::fmt::Write;
+                let _ = write!(sig, "{}:{};", f.name, f.size);
+            }
+            return sig;
+        }
+    }
+    if let Some(blob) = payload.blob.as_ref() {
+        // Descriptor mode (§3.3 large blob): `data` is empty. Key the signature
+        // on the content fingerprint when present, so two transfers of
+        // byte-identical content collide (a reflected/re-copied payload is
+        // deduped) even though each carries a fresh random `fetch_id`. Fall
+        // back to `fetch_id` for inline-less descriptors from older peers that
+        // don't send `content_hash`, preserving prior behaviour.
+        if let Some(fetch_id) = blob.fetch_id.as_ref() {
+            let total = blob.total_size.unwrap_or(0);
+            let key = blob.content_hash.as_deref().unwrap_or(fetch_id);
+            return format!("BLOBDESC:{}:{}:{}", blob.mime_type, key, total);
+        }
+        let raw = blob.data.as_bytes();
+        let head_len = raw.len().min(16);
+        let tail_start = raw.len().saturating_sub(16);
+        let mut sig = format!("BLOB:{}:{}:", blob.mime_type, raw.len());
+        for b in &raw[..head_len] {
+            use std::fmt::Write;
+            let _ = write!(sig, "{:02x}", b);
+        }
+        sig.push(':');
+        for b in &raw[tail_start..] {
+            use std::fmt::Write;
+            let _ = write!(sig, "{:02x}", b);
+        }
+        return sig;
+    }
+    if let Some(formats) = payload.formats.as_ref() {
+        if !formats.is_empty() {
+            let mut sig = payload.text.clone();
+            sig.push_str("|FORMATS:");
+            for f in formats {
+                use std::fmt::Write;
+                let _ = write!(sig, "{}:{};", f.mime_type, f.data.len());
+            }
+            return sig;
+        }
+    }
+    payload.text.clone()
+}
+
+/// Map a MIME string to an `image::ImageFormat`. Returns `None` for unknown
+/// types so callers can skip unsupported sources cleanly.
+#[cfg(target_os = "linux")]
+pub fn image_format_for_mime(mime: &str) -> Option<image::ImageFormat> {
+    match mime {
+        "image/png" => Some(image::ImageFormat::Png),
+        "image/jpeg" => Some(image::ImageFormat::Jpeg),
+        "image/webp" => Some(image::ImageFormat::WebP),
+        "image/bmp" | "image/x-bmp" => Some(image::ImageFormat::Bmp),
+        "image/tiff" => Some(image::ImageFormat::Tiff),
+        "image/gif" => Some(image::ImageFormat::Gif),
+        _ => None,
+    }
+}
+
+/// Decode raw clipboard bytes of a known image MIME and return a normalised
+/// `ClipboardBlob` containing PNG bytes. Used by both the Wayland (wlr) and
+/// GNOME-extension (D-Bus) backends. Returns `None` if the MIME isn't an
+/// image format we know, the bytes don't decode, or the encoded blob exceeds
+/// `MAX_CLIPBOARD_IMAGE_WIRE_BYTES`.
+///
+/// PNG sources skip the re-encode step — we just validate the bytes by
+/// loading them and reuse the original buffer.
+#[cfg(target_os = "linux")]
+pub fn normalize_image_blob_from_bytes(
+    bytes: Vec<u8>,
+    source_mime: &str,
+) -> Option<ClipboardBlob> {
+    let format = image_format_for_mime(source_mime)?;
+
+    let img = match image::load_from_memory_with_format(&bytes, format) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("Failed to decode clipboard {}: {}", source_mime, e);
+            return None;
+        }
+    };
+    let width = img.width();
+    let height = img.height();
+
+    let png_bytes = if matches!(format, image::ImageFormat::Png) {
+        bytes
+    } else {
+        let mut out = Vec::new();
+        if let Err(e) = img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        {
+            tracing::warn!("Failed to PNG-encode clipboard image: {}", e);
+            return None;
+        }
+        out
+    };
+
+    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        tracing::warn!(
+            "Clipboard image PNG ({} bytes) exceeds {} byte absolute cap; skipping.",
+            png_bytes.len(),
+            MAX_CLIPBOARD_IMAGE_BYTES
+        );
+        return None;
+    }
+
+    Some(ClipboardBlob::from_bytes(
+        "image/png",
+        &png_bytes,
+        Some(width),
+        Some(height),
+    ))
+}
+
+/// Build a `ClipboardBlob` from raw clipboard bytes, branching between
+/// passthrough (verbatim) and raster (PNG-normalise) paths based on the
+/// source MIME. Passthrough MIMEs ride the wire as-is — receivers re-stock
+/// them under the same MIME, so e.g. SVG copied from Inkscape pastes as SVG
+/// into a vector-aware destination on the receiving peer, and an animated
+/// GIF retains animation through to the receiver.
+///
+/// Passthrough blobs have `width = height = None`. For SVG that's because
+/// vector formats don't carry intrinsic raster dimensions; for GIF we
+/// could parse the LSD header but skip it deliberately because the
+/// TIRI-fix's `image_blob_eq_stable` falls back to byte-exact comparison
+/// when dims are absent, and passthrough bytes round-trip stably through
+/// every OS clipboard layer (SVG XML, GIF byte stream — both preserved
+/// verbatim by NSPasteboard / Win32 registered formats / wlroots), so
+/// byte-exact compare doesn't bounce.
+#[cfg(target_os = "linux")]
+pub fn build_image_blob(bytes: Vec<u8>, source_mime: &str) -> Option<ClipboardBlob> {
+    if is_passthrough_image_mime(source_mime) {
+        if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            tracing::warn!(
+                "Clipboard {} ({} bytes) exceeds {} byte absolute cap; skipping.",
+                source_mime,
+                bytes.len(),
+                MAX_CLIPBOARD_IMAGE_BYTES
+            );
+            return None;
+        }
+        return Some(ClipboardBlob::from_bytes(source_mime, &bytes, None, None));
+    }
+    normalize_image_blob_from_bytes(bytes, source_mime)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClipboardContent {
+    Text(String),
+    Files(Vec<String>),
+    Image(ClipboardBlob),
+    /// Plain text plus one or more alternate format representations
+    /// (text/html, text/rtf, …). Used when the OS clipboard offers rich
+    /// formats — receivers re-stock all the formats they can write.
+    Rich {
+        text: String,
+        formats: Vec<ClipboardFormat>,
+    },
+    None,
+}
+
+/// Pending self-writes whose clipboard echo we still expect to see (and must
+/// suppress), each tagged with the instant it was armed. This is a small
+/// bounded *list*, not a single slot, and that distinction is the fix for the
+/// large-text dedupe-reflection bug: a receiver can write several payloads in
+/// quick succession (e.g. a large text immediately followed by an HTML
+/// fragment), and a large write's echo is observed late. With a single slot
+/// the second write clobbered the first write's still-pending entry, so the
+/// first echo no longer matched and got reflected back to the sender. Keeping
+/// every recent self-write until its own echo arrives (or the TTL lapses)
+/// removes that race.
+///
+/// Each entry is consumed by the first read-back it matches, so two identical
+/// writes are suppressed by two echoes.
+static IGNORED_GUARD: Lazy<Arc<Mutex<Vec<(GuardKey, std::time::Instant)>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
+/// Hard cap on retained guard entries so a pathological burst of writes can't
+/// grow the list without bound. Far above the handful of writes that can
+/// realistically be in flight within `IGNORED_TTL`.
+const IGNORED_MAX_ENTRIES: usize = 16;
+
+/// How long a guard entry remains valid after being armed. Generous enough
+/// for the slowest legitimate echo (Windows `arboard::set_image` with full
+/// retry budget can take ~1.6 s; 10 s leaves comfortable headroom on slow
+/// disks / clipboard managers / etc). Shorter than the timescales at which
+/// stale state is likely to drive observable bugs.
+pub const IGNORED_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Compact, memory-bounded key for one pending self-write. `Text` is reduced
+/// to hash+len so a multi-MB clipboard write doesn't pin its bytes in the
+/// guard; other variants are small (or already size-capped) and are kept whole
+/// so the existing stable-equivalence checks apply unchanged.
+enum GuardKey {
+    Text { hash: u64, len: usize },
+    Other(ClipboardContent),
+}
+
+fn hash_text(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+fn guard_key_of(content: &ClipboardContent) -> Option<GuardKey> {
+    match content {
+        ClipboardContent::None => None,
+        ClipboardContent::Text(s) => Some(GuardKey::Text {
+            hash: hash_text(s),
+            len: s.len(),
+        }),
+        other => Some(GuardKey::Other(other.clone())),
+    }
+}
+
+/// Stable equivalence between a stored non-text self-write and a clipboard
+/// read-back, reusing the per-variant rules (`image_blob_eq_stable`,
+/// `rich_eq_stable`) that tolerate OS round-trip mangling.
+fn stable_eq(stored: &ClipboardContent, current: &ClipboardContent) -> bool {
+    match (stored, current) {
+        (ClipboardContent::Text(a), ClipboardContent::Text(b)) => a == b,
+        (ClipboardContent::Files(a), ClipboardContent::Files(b)) => a == b,
+        (ClipboardContent::Image(a), ClipboardContent::Image(b)) => image_blob_eq_stable(a, b),
+        (
+            ClipboardContent::Rich { text: at, formats: af },
+            ClipboardContent::Rich { text: bt, formats: bf },
+        ) => rich_eq_stable(at, af, bt, bf),
+        _ => false,
+    }
+}
+
+fn guard_key_matches(key: &GuardKey, current: &ClipboardContent) -> bool {
+    match key {
+        GuardKey::Text { hash, len } => {
+            matches!(current, ClipboardContent::Text(s) if s.len() == *len && hash_text(s) == *hash)
+        }
+        GuardKey::Other(stored) => stable_eq(stored, current),
+    }
+}
+
+/// Arm the guard for a self-write. All `set_clipboard_*_with_ignore` helpers
+/// funnel through this. Prunes expired entries and bounds the list length.
+fn set_ignored(content: ClipboardContent) {
+    let Some(key) = guard_key_of(&content) else {
+        return;
+    };
+    let mut guard = IGNORED_GUARD.lock().unwrap();
+    guard.retain(|(_, at)| at.elapsed() <= IGNORED_TTL);
+    guard.push((key, std::time::Instant::now()));
+    let len = guard.len();
+    if len > IGNORED_MAX_ENTRIES {
+        guard.drain(0..len - IGNORED_MAX_ENTRIES);
+    }
+}
+
+/// One-line summary of a `ClipboardContent` for log lines. Keep it compact
+/// so an event chain (`Set IGNORED → Check → MATCH/MISS → Broadcast?`) reads
+/// inline without wrapping.
+pub fn describe_content(c: &ClipboardContent) -> String {
+    match c {
+        ClipboardContent::None => "None".to_string(),
+        ClipboardContent::Text(s) => format!("Text(len={})", s.len()),
+        ClipboardContent::Files(f) => format!("Files(count={})", f.len()),
+        ClipboardContent::Image(b) => {
+            let dims = match (b.width, b.height) {
+                (Some(w), Some(h)) => format!("{}x{}", w, h),
+                _ => "?".to_string(),
+            };
+            format!(
+                "Image(mime={}, decoded={}, dims={})",
+                b.mime_type,
+                b.decoded_len(),
+                dims
+            )
+        }
+        ClipboardContent::Rich { text, formats } => {
+            let mimes: Vec<&str> = formats.iter().map(|f| f.mime_type.as_str()).collect();
+            format!("Rich(text_len={}, formats=[{}])", text.len(), mimes.join(", "))
+        }
+    }
+}
+
+/// Stable equivalence for image blobs across an OS-clipboard round-trip.
+///
+/// The IGNORED guard is a *one-shot* check whose only job is to suppress our
+/// own echo: we wrote an image to the OS clipboard and want to ignore the
+/// next read of "an image". The OS layer mangles both the bytes (RGBA → DIB
+/// → RGBA → re-encoded PNG produces different bytes for the same pixels)
+/// **and** the reported dimensions on Windows (CF_DIB header padding /
+/// alignment can shift width or height by a handful of pixels), so a strict
+/// `(mime, dims)` check produces false negatives that make the receiver
+/// re-broadcast every image it accepts. Same-mime image-vs-image is
+/// therefore treated as our own echo unconditionally.
+///
+/// False-suppression cost: if the user copies a *different* image within
+/// one poll cycle of receiving one, the new image is suppressed for that
+/// cycle and broadcast on the next (~500 ms later). Acceptable.
+fn image_blob_eq_stable(a: &ClipboardBlob, b: &ClipboardBlob) -> bool {
+    a.mime_type == b.mime_type
+}
+
+/// Stable equivalence for rich-text payloads across an OS-clipboard round-
+/// trip. The echo-guard has to cover a few different failure modes:
+///
+///   - macOS NSPasteboard normalising HTML/RTF line endings / charset
+///     declarations so per-format byte length differs but the text and
+///     MIME set are stable (the original TIRI fix — `(text, sorted MIME
+///     set)` equality).
+///   - The clipboard losing some MIMEs and/or the plain-text channel
+///     between our write and our read-back. Issue #17 surfaced two such
+///     paths: Windows CF_RTF write empties the clipboard, leaving the
+///     read-back as `(text="", formats=[text/rtf])`; the GNOME extension's
+///     `WriteFormats` is last-write-wins for similar reasons. In both
+///     cases the read-back's MIME set is a strict subset of what we wrote
+///     and the plain text has been dropped.
+///
+/// Rule: current matches ignored if its MIME set is a subset of ignored's
+/// AND its text is either equal to ignored's or empty (allowing for the
+/// "lost the plain-text channel" case). The check is bounded by
+/// `IGNORED_TTL` (10 s), so we only ever suppress near-write echoes — a
+/// stale guard times out before it can swallow an unrelated paste.
+///
+/// Edge case: a second copy that arrives within the TTL with empty plain
+/// text and a MIME subset of the first will be mis-suppressed as an echo.
+/// Strictly less likely than the original "same text, same MIME set"
+/// edge case, and the failure mode (one suppressed copy) is far cheaper
+/// than the bug it covers (clipboard cleared by a bounced-back truncation).
+fn rich_eq_stable(
+    ign_text: &str,
+    ign_formats: &[ClipboardFormat],
+    curr_text: &str,
+    curr_formats: &[ClipboardFormat],
+) -> bool {
+    if !curr_text.is_empty() && curr_text != ign_text {
+        return false;
+    }
+    let ign_mimes: std::collections::HashSet<&str> =
+        ign_formats.iter().map(|f| f.mime_type.as_str()).collect();
+    curr_formats
+        .iter()
+        .all(|f| ign_mimes.contains(f.mime_type.as_str()))
+}
+
+/// Outcome of an IGNORED-guard check. The caller uses this to decide both
+/// whether to broadcast AND whether to advance `last_content` — bundling the
+/// two stops the bug where a successful echo-suppression leaves
+/// `last_content` stale, so the next poll sees the same content as "new"
+/// and broadcasts it (which was the loop-back observed in production).
+pub enum EchoVerdict {
+    /// Real new content — broadcast it. Caller should also set
+    /// `last_content = current`.
+    Process,
+    /// Echo of our own write — IGNORED guard matched and was cleared. Don't
+    /// broadcast, but caller MUST set `last_content = current` so the next
+    /// poll doesn't re-flag the same content as "new" via the `IGNORED is
+    /// None` branch.
+    Echo,
+    /// Nothing to do — content unchanged from last seen, or empty. Caller
+    /// leaves `last_content` alone.
+    NoChange,
+}
+
+/// Process a clipboard read result through the dedup/feedback-loop logic.
+///
+/// Logging contract for the [Echo] tag (`info!`):
+///   `[Echo] Check: ignored=… current=… -> MATCH (clearing guard)` — guard fired
+///   `[Echo] Check: ignored=… current=… -> MISS (reason=…)` — guard didn't fire
+///   `[Echo] Triggering loop-back broadcast — IGNORED check missed`
+///     (only when a MISS leads to an actual broadcast)
+/// A MATCH should never be followed by a broadcast for the same content.
+pub fn should_process_content(
+    current_content: &ClipboardContent,
+    last_content: &ClipboardContent,
+) -> EchoVerdict {
+    if *current_content == ClipboardContent::None {
+        return EchoVerdict::NoChange;
+    }
+
+    let mut guard = IGNORED_GUARD.lock().unwrap();
+
+    // Expire entries whose echo never arrived within the TTL — e.g. a write
+    // that failed silently, or one pre-empted by a local copy before the OS
+    // round-trip completed. Without this a stuck entry could suppress an
+    // unrelated future read.
+    let before = guard.len();
+    guard.retain(|(_, at)| at.elapsed() <= IGNORED_TTL);
+    let expired = before - guard.len();
+    if expired > 0 {
+        tracing::info!(
+            "[Echo] Expired {} stale IGNORED guard entr{} (TTL {:?})",
+            expired,
+            if expired == 1 { "y" } else { "ies" },
+            IGNORED_TTL,
+        );
+    }
+
+    // If this read-back matches any pending self-write, it's our own echo.
+    // Consume just that one entry (not the whole list) so other in-flight
+    // self-writes stay guarded — this is what stops a second write from
+    // unmasking an earlier write's still-pending echo.
+    if let Some(idx) = guard
+        .iter()
+        .position(|(key, _)| guard_key_matches(key, current_content))
+    {
+        tracing::info!(
+            "[Echo] Check: current={} -> MATCH (consumed 1 of {} pending self-write{})",
+            describe_content(current_content),
+            guard.len(),
+            if guard.len() == 1 { "" } else { "s" },
+        );
+        guard.remove(idx);
+        return EchoVerdict::Echo;
+    }
+
+    // Not an echo of anything we wrote — new content iff it differs from what
+    // we last saw.
+    if current_content != last_content {
+        tracing::info!(
+            "[Echo] Triggering loop-back broadcast — no IGNORED match ({} pending); current={}",
+            guard.len(),
+            describe_content(current_content)
+        );
+        EchoVerdict::Process
+    } else {
+        EchoVerdict::NoChange
+    }
+}
+
+/// File extension for the §3.3 temp-file written when a large clipboard blob
+/// is staged for the file-transfer path. Used in `temp_downloads/<id>.<ext>`.
+/// Picked from MIME so the file is visually meaningful if it leaks past the
+/// startup `clear_cache` (which it shouldn't — but if it does, having the
+/// right extension makes manual cleanup easier).
+pub fn extension_for_clipboard_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/svg+xml" => "svg",
+        "image/webp" => "webp",
+        "image/bmp" | "image/x-bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "text/plain" => "txt",
+        _ => "bin",
+    }
+}
+
+/// Stage a large clipboard blob's raw bytes to disk in `temp_downloads/<id>.<ext>`
+/// and register the entry in `state.local_clipboard_blobs`. Used by the §3.3
+/// descriptor path: when an image's encoded size exceeds the inline cap, the
+/// sender writes the bytes here so peers can fetch them via the existing
+/// `clustercut-file` ALPN stream once they receive the descriptor on
+/// `Message::Clipboard`.
+fn stage_clipboard_blob_temp_file(
+    app: &AppHandle,
+    state: &AppState,
+    msg_id: &str,
+    mime_type: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("resolve cache dir: {}", e))?
+        .join("temp_downloads");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("create temp dir: {}", e))?;
+    storage::set_dir_owner_only(&cache_dir);
+
+    let ext = extension_for_clipboard_mime(mime_type);
+    let path = cache_dir.join(format!("{}.{}", msg_id, ext));
+
+    std::fs::write(&path, bytes).map_err(|e| format!("write temp file {:?}: {}", path, e))?;
+    storage::set_owner_only(&path);
+
+    let metadata = ClipboardBlobMetadata {
+        path: path.clone(),
+        mime_type: mime_type.to_string(),
+        width,
+        height,
+        total_size: bytes.len() as u64,
+    };
+
+    {
+        let mut map = state.local_clipboard_blobs.lock().unwrap();
+        map.insert(msg_id.to_string(), metadata);
+    }
+
+    Ok(())
+}
+
+/// Process a changed clipboard content: build payload and broadcast.
+pub fn process_clipboard_change(
+    content: ClipboardContent,
+    app_handle: &AppHandle,
+    state: &AppState,
+    transport: &Transport,
+) {
+    // Any non-echo clipboard change invalidates a pending GNOME "promote to
+    // rich" stash — the user copied something else on this machine, so the
+    // previously-offered promotion would clobber their new selection if the
+    // user later clicked "Switch to Rich" on a stale system notification.
+    // Cleared unconditionally here because by the time we reach
+    // `process_clipboard_change`, the echo guard in `should_process_content`
+    // has already let this through as fresh content (Process verdict).
+    {
+        let mut stash = state.pending_rich_promotion.lock().unwrap();
+        if stash.is_some() {
+            tracing::debug!(
+                "Clearing pending_rich_promotion — new clipboard change supersedes it"
+            );
+            *stash = None;
+        }
+    }
+
+    match content {
+        ClipboardContent::Text(text) => {
+            tracing::debug!("Clipboard Text Change Detected (len={})", text.len());
+
+            // Skip whitespace-only plain text. The monitors' `!is_empty()`
+            // checks pass strings like " " or "\n", but syncing those has
+            // negative information value: every peer that auto-receives
+            // would overwrite a useful clipboard with a single space. The
+            // rich path has the same shape in spirit, but defining "no
+            // meaningful content" for HTML/RTF would need markup parsing —
+            // `rich_eq_stable`'s subset rule covers the realistic bounce-
+            // back case there instead.
+            if text.trim().is_empty() {
+                tracing::debug!("Skipping broadcast — whitespace-only text");
+                return;
+            }
+
+            let hostname = crate::get_hostname_internal();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let local_id = state.local_device_id.lock().unwrap().clone();
+
+            match text_wire_decision(text.len()) {
+                TextWireDecision::Inline => {
+                    {
+                        let mut last_global = state.last_clipboard_content.lock().unwrap();
+                        if *last_global != text {
+                            *last_global = text.clone();
+                        }
+                    }
+                    let payload_obj = ClipboardPayload {
+                        id: msg_id,
+                        text,
+                        files: None,
+                        blob: None,
+                        formats: None,
+                        timestamp: ts,
+                        sender: hostname,
+                        sender_id: local_id,
+                    };
+                    broadcast_clipboard(app_handle, state, transport, payload_obj);
+                }
+                TextWireDecision::Descriptor => {
+                    let len = text.len() as u64;
+                    match stage_clipboard_blob_temp_file(
+                        app_handle, state, &msg_id, "text/plain", None, None, text.as_bytes(),
+                    ) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "[ClipboardText] Large text ({} bytes) — broadcasting descriptor (id={})",
+                                len, msg_id
+                            );
+                            let payload_obj = ClipboardPayload {
+                                id: msg_id.clone(),
+                                text: String::new(),
+                                files: None,
+                                blob: Some(
+                                    ClipboardBlob::descriptor("text/plain", msg_id, len, None, None)
+                                        .with_content_hash(content_fingerprint(text.as_bytes())),
+                                ),
+                                formats: None,
+                                timestamp: ts,
+                                sender: hostname,
+                                sender_id: local_id,
+                            };
+                            // Store the descriptor's dedup *signature* (not the
+                            // raw text) so a reflected/re-copied large text —
+                            // which always arrives as a descriptor — is caught
+                            // by the inbound dedup. content_hash keeps this
+                            // stable across the fresh fetch_id every send gets.
+                            {
+                                let mut last_global =
+                                    state.last_clipboard_content.lock().unwrap();
+                                *last_global = payload_signature(&payload_obj);
+                            }
+                            broadcast_clipboard(app_handle, state, transport, payload_obj);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to stage large clipboard text for descriptor path: {}", e);
+                        }
+                    }
+                }
+                TextWireDecision::TooLarge => {
+                    tracing::warn!(
+                        "Clipboard text is {} bytes (> {} cap); not sharing.",
+                        text.len(), MAX_CLIPBOARD_TEXT_BYTES
+                    );
+                    crate::send_notification(
+                        app_handle,
+                        "Clipboard too large to share",
+                        "The copied text is over 100 MB and was not sent to your cluster.",
+                        false,
+                        Some(4),
+                        "history",
+                        crate::NotificationPayload::None,
+                    );
+                }
+            }
+        }
+        ClipboardContent::Files(raw_paths) => {
+            tracing::debug!(
+                "Clipboard File Change Detected. Raw paths: {:?}",
+                raw_paths
+            );
+
+            let hostname = crate::get_hostname_internal();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let mut file_metas = Vec::new();
+            let mut valid_paths = Vec::new();
+
+            for path_str in &raw_paths {
+                let path_buf = if let Ok(u) = url::Url::parse(path_str) {
+                    if u.scheme() == "file" {
+                        if let Ok(p) = u.to_file_path() {
+                            p
+                        } else {
+                            std::path::PathBuf::from(path_str)
+                        }
+                    } else {
+                        std::path::PathBuf::from(path_str)
+                    }
+                } else {
+                    let decoded = percent_encoding::percent_decode_str(path_str)
+                        .decode_utf8_lossy();
+                    std::path::PathBuf::from(decoded.as_ref())
+                };
+
+                let path = path_buf.as_path();
+                if path.exists() {
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    file_metas.push(FileMetadata { name, size });
+                    valid_paths.push(path.to_string_lossy().to_string());
+                } else if path_buf.to_string_lossy() != *path_str {
+                    let raw_p = std::path::Path::new(path_str);
+                    if raw_p.exists() {
+                        let name = raw_p
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let size = std::fs::metadata(raw_p).map(|m| m.len()).unwrap_or(0);
+                        file_metas.push(FileMetadata { name, size });
+                        valid_paths.push(path_str.clone());
+                    } else {
+                        tracing::warn!("Path does not exist: {:?}", path);
+                    }
+                } else {
+                    tracing::warn!("Path does not exist: {:?}", path);
+                }
+            }
+
+            if !file_metas.is_empty() {
+                let mut sig = String::from("FILES:");
+                for f in &file_metas {
+                    use std::fmt::Write;
+                    let _ = write!(sig, "{}:{};", f.name, f.size);
+                }
+
+                {
+                    let mut last_global = state.last_clipboard_content.lock().unwrap();
+                    if *last_global == sig {
+                        tracing::debug!(
+                            "Ignoring broadcast - files match last_clipboard_content"
+                        );
+                        return;
+                    }
+                    *last_global = sig;
+                }
+
+                {
+                    let mut files_lock = state.local_files.lock().unwrap();
+                    files_lock.insert(msg_id.clone(), valid_paths);
+                }
+
+                let local_id = state.local_device_id.lock().unwrap().clone();
+                let payload_obj = ClipboardPayload {
+                    id: msg_id,
+                    text: String::new(),
+                    files: Some(file_metas),
+                    blob: None,
+                    formats: None,
+                    timestamp: ts,
+                    sender: hostname,
+                    sender_id: local_id,
+                };
+                broadcast_clipboard(app_handle, state, transport, payload_obj);
+            } else {
+                tracing::warn!("No valid files found in clipboard content.");
+            }
+        }
+        ClipboardContent::Image(blob) => {
+            tracing::debug!(
+                "Clipboard Image Change Detected (mime={}, decoded_len={})",
+                blob.mime_type,
+                blob.decoded_len()
+            );
+
+            let hostname = crate::get_hostname_internal();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let local_id = state.local_device_id.lock().unwrap().clone();
+
+            // Inline-vs-descriptor decision (§3.3). Decoded byte size is
+            // what would actually ride the wire as base64 inside
+            // Message::Clipboard; over the threshold, switch to the
+            // descriptor + file-transfer path.
+            let decoded_len = blob.decoded_len();
+            let payload_obj = if decoded_len <= MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+                ClipboardPayload {
+                    id: msg_id,
+                    text: String::new(),
+                    files: None,
+                    blob: Some(blob),
+                    formats: None,
+                    timestamp: ts,
+                    sender: hostname,
+                    sender_id: local_id,
+                }
+            } else {
+                // Descriptor path. Write the bytes to a temp file under the
+                // same `temp_downloads` dir the file-transfer path uses on
+                // the receiver side, register in `local_clipboard_blobs`, and
+                // emit a descriptor-only `ClipboardBlob` on the wire. Peers
+                // will respond with `Message::FileRequest` and pull the bytes
+                // over the `clustercut-file` ALPN.
+                let raw_bytes = match blob.raw_bytes() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to decode clipboard blob bytes for descriptor path: {}",
+                            e
+                        );
+                        return;
+                    }
+                };
+                match stage_clipboard_blob_temp_file(
+                    app_handle,
+                    state,
+                    &msg_id,
+                    &blob.mime_type,
+                    blob.width,
+                    blob.height,
+                    &raw_bytes,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "[ClipboardBlob] Large blob detected ({} bytes, mime={}) — broadcasting descriptor (id={})",
+                            raw_bytes.len(),
+                            blob.mime_type,
+                            msg_id
+                        );
+                        ClipboardPayload {
+                            id: msg_id.clone(),
+                            text: String::new(),
+                            files: None,
+                            blob: Some(
+                                ClipboardBlob::descriptor(
+                                    blob.mime_type.clone(),
+                                    msg_id,
+                                    raw_bytes.len() as u64,
+                                    blob.width,
+                                    blob.height,
+                                )
+                                .with_content_hash(content_fingerprint(&raw_bytes)),
+                            ),
+                            formats: None,
+                            timestamp: ts,
+                            sender: hostname,
+                            sender_id: local_id,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to stage large clipboard blob to temp file: {} (size={} bytes, mime={})",
+                            e,
+                            raw_bytes.len(),
+                            blob.mime_type
+                        );
+                        return;
+                    }
+                }
+            };
+
+            let sig = payload_signature(&payload_obj);
+            {
+                let mut last_global = state.last_clipboard_content.lock().unwrap();
+                if *last_global == sig {
+                    tracing::debug!(
+                        "Ignoring broadcast - blob matches last_clipboard_content"
+                    );
+                    return;
+                }
+                *last_global = sig;
+            }
+
+            broadcast_clipboard(app_handle, state, transport, payload_obj);
+        }
+        ClipboardContent::Rich { text, formats } => {
+            tracing::debug!(
+                "Clipboard Rich Change Detected (text_len={}, format_count={})",
+                text.len(),
+                formats.len()
+            );
+
+            let hostname = crate::get_hostname_internal();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let local_id = state.local_device_id.lock().unwrap().clone();
+            let payload_obj = ClipboardPayload {
+                id: msg_id,
+                text,
+                files: None,
+                blob: None,
+                formats: Some(formats),
+                timestamp: ts,
+                sender: hostname,
+                sender_id: local_id,
+            };
+
+            let sig = payload_signature(&payload_obj);
+            {
+                let mut last_global = state.last_clipboard_content.lock().unwrap();
+                if *last_global == sig {
+                    tracing::debug!(
+                        "Ignoring broadcast - rich payload matches last_clipboard_content"
+                    );
+                    return;
+                }
+                *last_global = sig;
+            }
+
+            broadcast_clipboard(app_handle, state, transport, payload_obj);
+        }
+        ClipboardContent::None => {}
+    }
+}
+
+/// Derive the re-callable `StoredContent` (and an optional base64 thumbnail)
+/// for a payload about to be emitted to the frontend. Returns `None` when the
+/// payload has no re-callable backing: a files-only payload, or a descriptor
+/// whose bytes aren't staged locally (receiver pending pre-fetch).
+pub fn stored_content_for_payload(
+    state: &AppState,
+    payload: &ClipboardPayload,
+) -> Option<(StoredContent, Option<String>)> {
+    if let Some(blob) = payload.blob.as_ref() {
+        if blob.is_descriptor() {
+            // Bytes live on disk in local_clipboard_blobs (sender) — point at
+            // the staged file. If it isn't staged here, there's no backing.
+            let meta = {
+                let map = state.local_clipboard_blobs.lock().unwrap();
+                map.get(&payload.id).cloned()
+            }?;
+            let thumb = if meta.mime_type.starts_with("image/") {
+                std::fs::read(&meta.path).ok().and_then(|b| make_thumbnail(&b))
+            } else {
+                None
+            };
+            return Some((
+                StoredContent::Disk {
+                    mime: meta.mime_type,
+                    path: meta.path,
+                    width: meta.width,
+                    height: meta.height,
+                    size: meta.total_size,
+                },
+                thumb,
+            ));
+        }
+        // Inline image.
+        let bytes = blob.raw_bytes().ok()?;
+        let thumb = make_thumbnail(&bytes);
+        return Some((
+            StoredContent::Image {
+                mime: blob.mime_type.clone(),
+                bytes,
+                width: blob.width,
+                height: blob.height,
+            },
+            thumb,
+        ));
+    }
+    if let Some(formats) = payload.formats.as_ref().filter(|f| !f.is_empty()) {
+        return Some((
+            StoredContent::Rich {
+                text: payload.text.clone(),
+                formats: formats.clone(),
+            },
+            None,
+        ));
+    }
+    if !payload.text.is_empty() {
+        return Some((StoredContent::Text(payload.text.clone()), None));
+    }
+    None
+}
+
+/// For a large-text Disk entry, read up to TEXT_PREVIEW_BYTES from the staged
+/// file so History can still show a snippet.
+fn disk_text_prefix(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; crate::clipboard::preview::TEXT_PREVIEW_BYTES];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    // A trailing byte split mid-char becomes U+FFFD via lossy decode — fine
+    // for a snippet (the full text is re-read from the file on re-call).
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// Apply the side effects of an eviction: delete the disk file (unless an
+/// in-flight fetch still needs it), drop the local_clipboard_blobs entry, and
+/// tell the UI the item's backing is gone.
+pub(crate) fn handle_evictions(app: &AppHandle, state: &AppState, evicted: Vec<Evicted>) {
+    for e in evicted {
+        {
+            let mut map = state.local_clipboard_blobs.lock().unwrap();
+            map.remove(&e.id);
+        }
+        if let Some(path) = e.disk_path {
+            let in_flight = {
+                let slot = state.in_flight_clipboard_fetch.lock().unwrap();
+                slot.as_deref() == Some(e.id.as_str())
+            };
+            let being_served = {
+                let m = state.serving_clipboard_blobs.lock().unwrap();
+                m.contains_key(&e.id)
+            };
+            if !in_flight && !being_served {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        let _ = app.emit("history-backing-evicted", &e.id);
+    }
+}
+
+/// Persist a payload's content into the History store and emit a light
+/// `ClipboardPreview` on `event` (replacing the old full-payload emit).
+pub fn record_and_emit(
+    app: &AppHandle,
+    state: &AppState,
+    event: &str,
+    payload: &ClipboardPayload,
+) {
+    let mut evicted = Vec::new();
+    let (text_preview, text_len, blob, has_backing) =
+        match stored_content_for_payload(state, payload) {
+            Some((content, thumb)) => {
+                let (mut tp, tl, bp) = preview_parts(&content, thumb);
+                // Large-text Disk entry: fill the snippet from the staged file.
+                if tp.is_none() && bp.is_none() {
+                    if let StoredContent::Disk { path, .. } = &content {
+                        tp = disk_text_prefix(path);
+                    }
+                }
+                evicted = state.history_store.lock().unwrap().insert(payload.id.clone(), content);
+                (tp, tl, bp, true)
+            }
+            None => {
+                let (tp, tl, bp) = descriptor_preview(payload);
+                (tp, tl, bp, false)
+            }
+        };
+
+    handle_evictions(app, state, evicted);
+
+    let preview = ClipboardPreview {
+        id: payload.id.clone(),
+        sender: payload.sender.clone(),
+        sender_id: payload.sender_id.clone(),
+        timestamp: payload.timestamp,
+        text_preview,
+        text_len,
+        blob,
+        formats: formats_preview(payload),
+        files: payload.files.clone(),
+        has_backing,
+    };
+    let _ = app.emit(event, &preview);
+}
+
+pub fn broadcast_clipboard(
+    app_handle: &AppHandle,
+    state: &AppState,
+    transport: &Transport,
+    payload_obj: ClipboardPayload,
+) {
+    let auto_send = { state.settings.lock().unwrap().auto_send };
+    if !auto_send {
+        tracing::debug!("Auto-send disabled. Emitting monitor update only.");
+        record_and_emit(app_handle, state, "clipboard-monitor-update", &payload_obj);
+        return;
+    }
+
+    record_and_emit(app_handle, state, "clipboard-change", &payload_obj);
+
+    // Send the typed payload directly. mTLS provides confidentiality
+    // and sender authenticity; no app-layer encryption needed since
+    // cluster_key was retired in v0.3.
+    let msg = Message::Clipboard(payload_obj.clone());
+    let data = match serde_json::to_vec(&msg) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Failed to serialize clipboard message: {}", e);
+            return;
+        }
+    };
+
+    let peers = state.get_peers();
+    if !peers.is_empty() {
+        let notifications = state.settings.lock().unwrap().notifications.clone();
+        if notifications.data_sent {
+            let body = if payload_obj.files.is_some() {
+                "File info broadcasted to cluster."
+            } else if payload_obj.blob.is_some() {
+                "Image broadcasted to cluster."
+            } else {
+                "Clipboard content broadcasted to cluster."
+            };
+            crate::send_notification(
+                app_handle,
+                "Clipboard Sent",
+                body,
+                false,
+                Some(2),
+                "history",
+                crate::NotificationPayload::None,
+            );
+        }
+    }
+
+    for peer in peers.values() {
+        let addr = std::net::SocketAddr::new(peer.ip, peer.port);
+        let transport_clone = transport.clone();
+        let data_vec = data.clone();
+        let app_clone = app_handle.clone();
+        let peer_id = peer.id.clone();
+        let peer_hostname = peer.hostname.clone();
+        let peer_version = peer.protocol_version.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
+                crate::report_send_failure(
+                    &app_clone,
+                    &peer_id,
+                    &peer_hostname,
+                    peer_version.as_deref(),
+                    addr,
+                    &e.to_string(),
+                );
+            } else {
+                tracing::info!("Sent clipboard to {}", addr);
+            }
+        });
+    }
+}
+
+/// Set clipboard text, with feedback loop prevention.
+pub fn set_clipboard_with_ignore(app: &AppHandle, text: String, write_fn: fn(&AppHandle, String) -> Result<(), String>) {
+    let app_handle = app.clone();
+    let text_clone = text.clone();
+
+    thread::spawn(move || {
+        let content = ClipboardContent::Text(text_clone.clone());
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
+
+        if let Err(e) = write_fn(&app_handle, text_clone) {
+            tracing::error!("Failed to set clipboard text: {}", e);
+        } else {
+            tracing::debug!("Successfully set local clipboard text.");
+        }
+    });
+}
+
+/// Set clipboard files, with feedback loop prevention.
+pub fn set_clipboard_paths_with_ignore(app: &AppHandle, paths: Vec<String>, write_fn: fn(&AppHandle, Vec<String>) -> Result<(), String>) {
+    let app_handle = app.clone();
+    let paths_clone = paths.clone();
+
+    thread::spawn(move || {
+        let content = ClipboardContent::Files(paths_clone.clone());
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
+
+        if let Err(e) = write_fn(&app_handle, paths_clone) {
+            tracing::error!("Failed to set clipboard files: {}", e);
+        } else {
+            tracing::debug!("Successfully set local clipboard files.");
+        }
+    });
+}
+
+/// Set clipboard rich content (plain text plus alternate formats like
+/// text/html and text/rtf), with feedback loop prevention. The IGNORED_CONTENT
+/// guard fires if the same Rich payload bounces straight back to us.
+pub fn set_clipboard_rich_with_ignore(
+    app: &AppHandle,
+    text: String,
+    formats: Vec<ClipboardFormat>,
+    write_fn: fn(&AppHandle, &str, &[ClipboardFormat]) -> Result<(), String>,
+) {
+    let app_handle = app.clone();
+    let text_clone = text.clone();
+    let formats_clone = formats.clone();
+
+    thread::spawn(move || {
+        let content = ClipboardContent::Rich {
+            text: text_clone.clone(),
+            formats: formats_clone.clone(),
+        };
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
+
+        if let Err(e) = write_fn(&app_handle, &text_clone, &formats_clone) {
+            tracing::error!("Failed to set clipboard rich content: {}", e);
+        } else {
+            tracing::debug!(
+                "Successfully set local clipboard rich (text_len={}, format_count={}).",
+                text_clone.len(),
+                formats_clone.len()
+            );
+        }
+    });
+}
+
+/// Set clipboard image blob, with feedback loop prevention.
+/// `write_fn` is the platform-specific writer that places `data` on the OS clipboard
+/// under `mime_type` (canonically "image/png" today).
+pub fn set_clipboard_blob_with_ignore(
+    app: &AppHandle,
+    blob: ClipboardBlob,
+    write_fn: fn(&AppHandle, &ClipboardBlob) -> Result<(), String>,
+) {
+    let app_handle = app.clone();
+    let blob_clone = blob.clone();
+
+    thread::spawn(move || {
+        let content = ClipboardContent::Image(blob_clone.clone());
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
+
+        if let Err(e) = write_fn(&app_handle, &blob_clone) {
+            tracing::error!("Failed to set clipboard blob: {}", e);
+        } else {
+            tracing::debug!(
+                "Successfully set local clipboard blob (mime={}, decoded_len={}).",
+                blob_clone.mime_type,
+                blob_clone.decoded_len()
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ClipboardFormat;
+
+    fn payload_with(text: &str, formats: Option<Vec<ClipboardFormat>>) -> ClipboardPayload {
+        ClipboardPayload {
+            id: "id".to_string(),
+            text: text.to_string(),
+            files: None,
+            blob: None,
+            formats,
+            timestamp: 0,
+            sender: "host".to_string(),
+            sender_id: "device".to_string(),
+        }
+    }
+
+    #[test]
+    fn signature_plain_text_is_just_text() {
+        let p = payload_with("hello", None);
+        assert_eq!(payload_signature(&p), "hello");
+    }
+
+    #[test]
+    fn signature_with_empty_formats_falls_back_to_text() {
+        let p = payload_with("hello", Some(vec![]));
+        assert_eq!(payload_signature(&p), "hello");
+    }
+
+    #[test]
+    fn signature_with_formats_includes_mime_and_lengths() {
+        let html = ClipboardFormat::from_text("text/html", "<p>Hi</p>");
+        let rtf = ClipboardFormat::from_text("text/rtf", r"{\rtf1 Hi}");
+        let p = payload_with("Hi", Some(vec![html.clone(), rtf.clone()]));
+        let sig = payload_signature(&p);
+        assert!(sig.starts_with("Hi|FORMATS:"), "got: {}", sig);
+        assert!(sig.contains(&format!("text/html:{};", html.data.len())));
+        assert!(sig.contains(&format!("text/rtf:{};", rtf.data.len())));
+    }
+
+    #[test]
+    fn signature_distinguishes_same_text_different_formats() {
+        let html_a = ClipboardFormat::from_text("text/html", "<p>v1</p>");
+        let html_b = ClipboardFormat::from_text("text/html", "<p>version 2</p>");
+        let a = payload_with("plain", Some(vec![html_a]));
+        let b = payload_with("plain", Some(vec![html_b]));
+        assert_ne!(payload_signature(&a), payload_signature(&b));
+    }
+
+    #[test]
+    fn signature_distinguishes_different_text_same_formats() {
+        let html = ClipboardFormat::from_text("text/html", "<p>x</p>");
+        let a = payload_with("first", Some(vec![html.clone()]));
+        let b = payload_with("second", Some(vec![html]));
+        assert_ne!(payload_signature(&a), payload_signature(&b));
+    }
+
+    // ─── TIRI: stable IGNORED_CONTENT comparison ───────────────────────────
+
+    fn blob(mime: &str, data: &str, w: Option<u32>, h: Option<u32>) -> ClipboardBlob {
+        ClipboardBlob {
+            mime_type: mime.to_string(),
+            data: data.to_string(),
+            width: w,
+            height: h,
+            fetch_id: None,
+            total_size: None,
+            content_hash: None,
+        }
+    }
+
+    #[test]
+    fn image_blob_eq_stable_matches_round_tripped_bytes() {
+        // Same dims, different bytes — what TIRI looks like on the wire.
+        let a = blob("image/png", "AAA…ORIGINAL_BYTES…", Some(1280), Some(720));
+        let b = blob("image/png", "ZZZ…ROUNDTRIPPED…", Some(1280), Some(720));
+        assert_ne!(a, b, "byte-exact PartialEq must still see them as different");
+        assert!(image_blob_eq_stable(&a, &b), "stable comparator must match");
+    }
+
+    #[test]
+    fn image_blob_eq_stable_matches_when_dimensions_differ() {
+        // The Windows CF_DIB round-trip can shift reported dims by a handful
+        // of pixels (header padding artifacts). Same-mime images are now
+        // treated as our own echo regardless — the IGNORED guard is one-shot
+        // so the false-suppression cost is at most one poll cycle.
+        let a = blob("image/png", "X", Some(1280), Some(720));
+        let b = blob("image/png", "X", Some(640), Some(480));
+        assert!(image_blob_eq_stable(&a, &b));
+    }
+
+    #[test]
+    fn image_blob_eq_stable_distinguishes_different_mime() {
+        let a = blob("image/png", "X", Some(100), Some(100));
+        let b = blob("image/jpeg", "X", Some(100), Some(100));
+        assert!(!image_blob_eq_stable(&a, &b));
+    }
+
+    #[test]
+    fn image_blob_eq_stable_matches_same_mime_without_dimensions() {
+        // No dims present (legacy/hand-built blobs) still match if the mime
+        // matches — same one-shot rationale.
+        let a = blob("image/png", "X", None, None);
+        let b = blob("image/png", "Y", None, None);
+        assert!(image_blob_eq_stable(&a, &b));
+    }
+
+    #[test]
+    fn rich_eq_stable_matches_normalised_format_bytes() {
+        // Plain text identical, MIMEs identical, but format bytes differ —
+        // what rich-text TIRI looks like on the wire (line endings,
+        // charset declarations etc. normalised by the OS clipboard layer).
+        let ign_html = ClipboardFormat::from_text("text/html", "<p>v1\n</p>");
+        let curr_html = ClipboardFormat::from_text("text/html", "<p>v1\r\n</p>");
+        let ign = vec![ign_html];
+        let curr = vec![curr_html];
+        assert!(rich_eq_stable("hello", &ign, "hello", &curr));
+    }
+
+    #[test]
+    fn rich_eq_stable_distinguishes_different_text() {
+        let html = ClipboardFormat::from_text("text/html", "<p>x</p>");
+        let formats = vec![html];
+        assert!(!rich_eq_stable("hello", &formats, "world", &formats));
+    }
+
+    #[test]
+    fn rich_eq_stable_distinguishes_different_mime_set() {
+        let only_html = vec![ClipboardFormat::from_text("text/html", "<p>x</p>")];
+        let html_and_rtf = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        assert!(!rich_eq_stable("hello", &only_html, "hello", &html_and_rtf));
+    }
+
+    // ─── §3.3 — descriptor signature is stable, fetch_id-keyed ─────────────
+
+    #[test]
+    fn signature_for_descriptor_blob_uses_fetch_id() {
+        let descriptor = ClipboardBlob::descriptor(
+            "image/png",
+            "abc-123",
+            25_000_000,
+            Some(1920),
+            Some(1080),
+        );
+        let payload = ClipboardPayload {
+            id: "abc-123".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(descriptor),
+            formats: None,
+            timestamp: 0,
+            sender: "host".to_string(),
+            sender_id: "device".to_string(),
+        };
+        let sig = payload_signature(&payload);
+        assert!(sig.starts_with("BLOBDESC:image/png:abc-123:"), "got: {}", sig);
+        assert!(sig.contains("25000000"), "size missing from sig: {}", sig);
+    }
+
+    #[test]
+    fn signature_descriptor_distinguishes_different_fetch_ids() {
+        let a = ClipboardBlob::descriptor("image/png", "id-a", 100, None, None);
+        let b = ClipboardBlob::descriptor("image/png", "id-b", 100, None, None);
+        let pa = ClipboardPayload {
+            id: "id-a".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(a),
+            formats: None,
+            timestamp: 0,
+            sender: "h".to_string(),
+            sender_id: "d".to_string(),
+        };
+        let pb = ClipboardPayload {
+            id: "id-b".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(b),
+            formats: None,
+            timestamp: 0,
+            sender: "h".to_string(),
+            sender_id: "d".to_string(),
+        };
+        assert_ne!(payload_signature(&pa), payload_signature(&pb));
+    }
+
+    fn descriptor_payload(blob: ClipboardBlob) -> ClipboardPayload {
+        ClipboardPayload {
+            id: "ignored-here".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(blob),
+            formats: None,
+            timestamp: 0,
+            sender: "h".to_string(),
+            sender_id: "d".to_string(),
+        }
+    }
+
+    #[test]
+    fn descriptor_signature_keys_on_content_hash_not_transfer_id() {
+        // Two descriptors for byte-identical content but different transfer ids
+        // must dedupe as equal — otherwise a re-sent or reflected large payload
+        // gets a fresh fetch_id and escapes the broadcast-dedup safety net
+        // (Michael's #2, Defect 2).
+        let a = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-a", 12_345, None, None)
+                .with_content_hash("c0ffee"),
+        );
+        let b = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-b", 12_345, None, None)
+                .with_content_hash("c0ffee"),
+        );
+        assert_eq!(payload_signature(&a), payload_signature(&b));
+    }
+
+    #[test]
+    fn descriptor_signature_distinguishes_different_content_hashes() {
+        // Same transfer id, different content — must NOT dedupe.
+        let a = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-x", 12_345, None, None)
+                .with_content_hash("aaaa"),
+        );
+        let b = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-x", 12_345, None, None)
+                .with_content_hash("bbbb"),
+        );
+        assert_ne!(payload_signature(&a), payload_signature(&b));
+    }
+
+    #[test]
+    fn rich_eq_stable_ignores_mime_order() {
+        // Sender side may emit formats in any order; receiver may store in
+        // a different order. Stable compare must not care.
+        let order_a = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        let order_b = vec![
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+        ];
+        assert!(rich_eq_stable("hello", &order_a, "hello", &order_b));
+    }
+
+    #[test]
+    fn rich_eq_stable_matches_subset_when_text_preserved() {
+        // Issue #17 shape A: ignored had [html, rtf], current has [rtf] only
+        // (one MIME dropped on the round-trip) but plain text is intact.
+        let ign = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
+        assert!(rich_eq_stable("hello", &ign, "hello", &curr));
+    }
+
+    #[test]
+    fn rich_eq_stable_matches_subset_when_text_lost() {
+        // Issue #17 shape B: ignored had [html, rtf] with non-empty text;
+        // current has just [rtf] and empty text (Windows last-write-wins
+        // wiped CF_UNICODETEXT and CF_HTML when CF_RTF was set).
+        let ign = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
+        assert!(rich_eq_stable("hello", &ign, "", &curr));
+    }
+
+    #[test]
+    fn rich_eq_stable_rejects_non_subset_even_with_empty_text() {
+        // A genuinely-different copy that happens to land with empty plain
+        // text must still be processed — it offers a MIME the IGNORED
+        // guard never wrote, so it can't be our echo.
+        let ign = vec![ClipboardFormat::from_text("text/html", "<p>x</p>")];
+        let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
+        assert!(!rich_eq_stable("hello", &ign, "", &curr));
+    }
+
+    // ─── Large-text dedupe-reflection (Michael #2) ──────────────────────────
+
+    /// Serializes the tests that mutate the process-global IGNORED guard so the
+    /// default parallel test runner can't let them clobber one another.
+    fn echo_guard_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn verdict_name(v: &EchoVerdict) -> &'static str {
+        match v {
+            EchoVerdict::Process => "Process (reflect/broadcast)",
+            EchoVerdict::Echo => "Echo (suppress)",
+            EchoVerdict::NoChange => "NoChange",
+        }
+    }
+
+    /// Reproduces Michael's large-text dedupe-reflection (#2).
+    ///
+    /// On the receiver, a payload is written to the OS clipboard and the
+    /// one-shot IGNORED guard is armed so the resulting clipboard echo is
+    /// suppressed (not re-broadcast). But a large-text write is slow, so its
+    /// echo is observed late — and if a SECOND payload of a different variant
+    /// (the interleaved HTML in Michael's repro) is written in the meantime,
+    /// it clobbers the single guard slot. When the delayed large-text echo
+    /// finally surfaces it no longer matches the guard, so the receiver
+    /// reflects its OWN write back to the sender.
+    ///
+    /// Size is irrelevant to this logic — on a real device the payload size
+    /// only widens the window before the echo is polled; the guard defect is
+    /// the single-slot clobber, reproduced here deterministically.
+    #[test]
+    fn receiver_does_not_reflect_first_write_when_second_write_clobbers_guard() {
+        let _serial = echo_guard_test_lock();
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        let first_write = ClipboardContent::Text("received large text".to_string());
+        let clobber = ClipboardContent::Rich {
+            text: "frag".to_string(),
+            formats: vec![ClipboardFormat::from_text("text/html", "<p>frag</p>")],
+        };
+        // What the receiver last saw before this pair of writes; the first
+        // write is "new" relative to it, so absent echo-suppression it
+        // broadcasts.
+        let previously_seen = ClipboardContent::Text("older content".to_string());
+
+        // Receiver writes the first payload (arming the guard), then the second
+        // payload lands before the first write's clipboard echo is polled.
+        set_ignored(first_write.clone());
+        set_ignored(clobber);
+
+        // The delayed echo of the first write finally surfaces.
+        let verdict = should_process_content(&first_write, &previously_seen);
+
+        // Reset the global guard before asserting so a failure can't leak state
+        // into another test.
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        assert!(
+            matches!(verdict, EchoVerdict::Echo),
+            "receiver reflected its own write back to the sender \
+             (verdict = {}); the single-slot IGNORED guard was clobbered by the \
+             second write and could no longer recognise the first write's echo",
+            verdict_name(&verdict),
+        );
+    }
+
+    /// Companion to the clobber case: when two self-writes are pending and
+    /// their echoes arrive in the *other* order (the second write's echo
+    /// first), both must still be suppressed. The old single-slot guard
+    /// cleared on the first echo and then reflected the second — the
+    /// orphaned-echo half of the same bug (matches the startup Files loop-back
+    /// seen in the wild).
+    #[test]
+    fn both_self_writes_suppressed_regardless_of_echo_order() {
+        let _serial = echo_guard_test_lock();
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        let text = ClipboardContent::Text("payload one".to_string());
+        let rich = ClipboardContent::Rich {
+            text: "two".to_string(),
+            formats: vec![ClipboardFormat::from_text("text/html", "<p>two</p>")],
+        };
+        let previously_seen = ClipboardContent::Text("older content".to_string());
+
+        set_ignored(text.clone());
+        set_ignored(rich.clone());
+
+        // Echoes surface in reverse order: the rich write's echo first.
+        let v_rich = should_process_content(&rich, &previously_seen);
+        let v_text = should_process_content(&text, &previously_seen);
+
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        assert!(
+            matches!(v_rich, EchoVerdict::Echo),
+            "rich self-write echo not suppressed (verdict = {})",
+            verdict_name(&v_rich),
+        );
+        assert!(
+            matches!(v_text, EchoVerdict::Echo),
+            "text self-write reflected after the rich echo consumed the slot \
+             (verdict = {})",
+            verdict_name(&v_text),
+        );
+    }
+
+    /// The guard must not over-suppress: a genuine new copy the user made
+    /// (never written by us) is still broadcast.
+    #[test]
+    fn genuinely_new_content_is_still_broadcast() {
+        let _serial = echo_guard_test_lock();
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        let verdict = should_process_content(
+            &ClipboardContent::Text("a fresh user copy".to_string()),
+            &ClipboardContent::Text("older content".to_string()),
+        );
+
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        assert!(
+            matches!(verdict, EchoVerdict::Process),
+            "new user content should broadcast, not be swallowed (verdict = {})",
+            verdict_name(&verdict),
+        );
+    }
+}
+
+#[cfg(test)]
+mod text_wire_tests {
+    use super::{text_wire_decision, TextWireDecision,
+                MAX_CLIPBOARD_TEXT_WIRE_BYTES, MAX_CLIPBOARD_TEXT_BYTES};
+
+    #[test]
+    fn small_text_inlines() {
+        assert_eq!(text_wire_decision(0), TextWireDecision::Inline);
+        assert_eq!(text_wire_decision(1024), TextWireDecision::Inline);
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_WIRE_BYTES), TextWireDecision::Inline);
+    }
+
+    #[test]
+    fn medium_text_uses_descriptor() {
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_WIRE_BYTES + 1), TextWireDecision::Descriptor);
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_BYTES), TextWireDecision::Descriptor);
+    }
+
+    #[test]
+    fn huge_text_is_too_large() {
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_BYTES + 1), TextWireDecision::TooLarge);
+    }
+}

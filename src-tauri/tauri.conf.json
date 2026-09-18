@@ -1,0 +1,89 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ClusterCut",
+  "version": "0.4.3",
+  "identifier": "app.clustercut.clustercut",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ClusterCut",
+        "width": 800,
+        "height": 600,
+        "minWidth": 640,
+        "minHeight": 520,
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'"
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "schemes": [
+        "clustercut"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb",
+      "rpm",
+      "nsis",
+      "dmg"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "dmg": {
+        "background": "assets/dmg-background.png",
+        "windowSize": {
+          "width": 660,
+          "height": 416
+        },
+        "appPosition": {
+          "x": 122,
+          "y": 243
+        },
+        "applicationFolderPosition": {
+          "x": 538,
+          "y": 243
+        }
+      }
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/icons/hicolor/scalable/status/app.clustercut.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/share/icons/hicolor/scalable/status/app.clustercut.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
+        }
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "English"
+        ]
+      }
+    }
+  }
+}
